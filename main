@@ -1,0 +1,1446 @@
+/********************************************************************
+ * DUBBELE BATTERIJ HOOFDCONTROLLER - VEILIGE HERSCHRIJVING
+ *
+ * Uitgangen:
+ * 1: Bat1 laadvermogen
+ * 2: Bat1 ontlaadvermogen
+ * 3: Bat2 gdes
+ * 4: Bat2 blo
+ * 5: Bat2 bup
+ * 6: debug heartbeat
+ * 7: kleine PV curtailment
+ *
+ * Opmerking:
+ * - Prijs-units zijn bewust ongewijzigd gelaten.
+ * - Veilig falen bij ongeldige kritieke invoer.
+ * - Bij negatieve verkoopprijs probeert het systeem alleen
+ *   werkelijk PV-overschot lokaal op te nemen.
+ * - Als er géén werkelijk overschot is bij negatieve verkoopprijs,
+ *   dan wacht Bat2 echt en wordt netladen niet geopend.
+ * - Kleine PV wordt pas begrensd als batterijen het overschot
+ *   niet voldoende kunnen opnemen en export ongewenst is.
+ * - Nachtelijke anti-import geldt alleen als er genoeg zon
+ *   morgen verwacht wordt én de batterijen vol genoeg zijn.
+ ********************************************************************/
+
+/********************************************************************
+ * HULPFUNCTIES
+ ********************************************************************/
+
+const STANDAARD_SOC = 50;
+const EPS_STANDAARD = 10;
+
+function naarGetal(v) {
+  if (v === null || v === undefined) return NaN;
+  if (typeof v === "number") return Number.isFinite(v) ? v : NaN;
+  if (typeof v === "string") {
+    const s = v.trim().replace(",", ".");
+    const m = s.match(/^-?\d+(\.\d+)?$/) || s.match(/-?\d+(\.\d+)?/);
+    return m ? Number(m[0]) : NaN;
+  }
+  return NaN;
+}
+
+function begrens(x, min, max) {
+  if (!Number.isFinite(x)) return min;
+  return Math.min(Math.max(x, min), max);
+}
+
+function eindigOf(waarde, fallback) {
+  return Number.isFinite(waarde) ? waarde : fallback;
+}
+
+function leesGetal(msg, sleutel, fallback = NaN, minimum = null) {
+  const n = naarGetal(msg[sleutel]);
+  if (!Number.isFinite(n)) return fallback;
+  if (minimum !== null) return Math.max(minimum, n);
+  return n;
+}
+
+function leesNietNegatief(msg, sleutel, fallback = 0) {
+  return leesGetal(msg, sleutel, fallback, 0);
+}
+
+function gewijzigd(sleutel, waarde, eps = EPS_STANDAARD) {
+  const vorige = context.get(sleutel);
+  context.set(sleutel, waarde);
+
+  if (!Number.isFinite(waarde) || !Number.isFinite(vorige)) {
+    return vorige !== waarde;
+  }
+  return vorige === undefined || Math.abs(waarde - vorige) > eps;
+}
+
+function vastGetalVeilig(x, cijfers = 2, fallback = null) {
+  return Number.isFinite(x) ? Number(x.toFixed(cijfers)) : fallback;
+}
+
+function formatPct(x) {
+  return Number.isFinite(x) ? `${Math.round(x)}%` : "?";
+}
+
+function formatKwh(x) {
+  return Number.isFinite(x) ? `${x.toFixed(2)} kWh` : "?";
+}
+
+function formatW(x) {
+  return Number.isFinite(x) ? `${Math.round(x)} W` : "?";
+}
+
+function statusFout(tekst) {
+  node.status({ fill: "red", shape: "ring", text: tekst });
+}
+
+function leesCfgGetal(cfg, sleutel, fallback) {
+  const n = Number(cfg[sleutel]);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function veiligeFoutTerugkeer(fouttekst, extraDebug = {}) {
+  statusFout(fouttekst);
+
+  const debug = {
+    veiligGefaald: true,
+    fout: fouttekst,
+    ...extraDebug
+  };
+
+  return [
+    { topic: "charge", payload: 0, charge: 0, ...debug },
+    { topic: "discharge", payload: 0, discharge: 0, ...debug },
+    { topic: "sofar_gdes_w", payload: 0, ...debug },
+    { topic: "sofar_blo_w", payload: -200, ...debug },
+    { topic: "sofar_bup_w", payload: -1, ...debug },
+    {
+      topic: "debug",
+      payload: {
+        ts: new Date().toISOString(),
+        veiligGefaald: true,
+        fout: fouttekst
+      },
+      ...debug
+    },
+    { topic: "pv2_limit_w", payload: 0, ...debug }
+  ];
+}
+
+/********************************************************************
+ * TIJD
+ ********************************************************************/
+
+const nuMs = Date.now();
+const nu = new Date(nuMs);
+const uur = nu.getHours();
+const maand = nu.getMonth() + 1;
+
+const isWinter = maand <= 3 || maand >= 11;
+const nachtUren = uur >= 0 && uur < 8;
+const lateNamiddag = uur >= 15;
+const avondBijna = uur >= 16;
+const avond = uur >= 17;
+
+/********************************************************************
+ * CONFIGURATIE
+ ********************************************************************/
+
+const CFG = flow.get("cfg") || {};
+
+const CAP_TARGET_W = leesCfgGetal(CFG, "cap_target_w", 2500);
+const CAP_PRETRIGGER_W = leesCfgGetal(CFG, "cap_pretrigger_w", 2350);
+
+const PV2_MAX_W = 800;
+const PV2_SLEW = leesCfgGetal(CFG, "pv2_slew_w", 80);
+const PV2_MARGIN_NEG = leesCfgGetal(CFG, "pv2_margin_neg_w", 150);
+
+const BAT1_MAX_CHARGE = Math.min(leesCfgGetal(CFG, "bat1_max_charge_opp_w", 800), 2000);
+const BAT1_MAX_DISCH = 2000;
+const BAT1_MIN_ACTION = 200;
+const BAT1_MIN_SOC_DISCH = 11;
+
+const BAT2_MAX_CHARGE = 3000;
+const BAT2_MIN_SOC = isWinter ? 35 : 25;
+
+const BAT1_USABLE_KWH = 5.12 * 0.89;
+const BAT2_USABLE_KWH = 10 * 0.80;
+const TOTAAL_BRUIKBAAR_KWH = BAT1_USABLE_KWH + BAT2_USABLE_KWH;
+
+/********************************************************************
+ * INGANGEN
+ ********************************************************************/
+
+const p1 = naarGetal(msg.p1);
+if (!Number.isFinite(p1)) {
+  return veiligeFoutTerugkeer(`Ongeldige p1: '${msg.p1}'`, { ruwe_p1: msg.p1 });
+}
+
+const soc1Ruw = naarGetal(msg.soc1 ?? msg.soc);
+const soc2Ruw = naarGetal(msg.soc2);
+
+const soc1Ontbreekt = !Number.isFinite(soc1Ruw);
+const soc2Ontbreekt = !Number.isFinite(soc2Ruw);
+
+const soc1 = begrens(eindigOf(soc1Ruw, STANDAARD_SOC), 0, 100);
+const soc2 = begrens(eindigOf(soc2Ruw, STANDAARD_SOC), 0, 100);
+
+const overKwh = leesNietNegatief(msg, "over", 0);
+const pvMorgen = leesNietNegatief(msg, "pv_tomorrow", 0);
+const pv12hW = leesNietNegatief(msg, "pv12h", 0);
+const pv24hW = leesNietNegatief(msg, "pv24h", 0);
+const p1q15 = naarGetal(msg.p1q15);
+const pv2Nu = leesNietNegatief(msg, "wkleinezon", 0);
+
+const beideSocOntbreken = soc1Ontbreekt && soc2Ontbreekt;
+if (beideSocOntbreken) {
+  return veiligeFoutTerugkeer("Beide SOC-metingen ontbreken; batterijacties geweigerd", {
+    ruwe_soc1: msg.soc1 ?? msg.soc,
+    ruwe_soc2: msg.soc2
+  });
+}
+
+/********************************************************************
+ * PRIJSVERWERKING
+ * Prijs-units blijven bewust identiek aan het origineel.
+ ********************************************************************/
+
+function spotNaarContractPrijzen(spotEurPerKwh) {
+  if (!Number.isFinite(spotEurPerKwh)) {
+    return { buy: NaN, sell: NaN };
+  }
+
+  const AFNAME_A = 1.0617;
+  const AFNAME_B = 0.1019;
+  const INJECTIE_A = -1.2965;
+  const INJECTIE_B = 0.1000;
+  const BTW_FACTOR = 1.06;
+
+  const GROEN_OPTIE_CENT_PER_KWH_INCL_BTW = 1.060;
+  const WKK_KOST_CENT_PER_KWH_INCL_BTW = 1.582;
+
+  const DISTR_EUR_PER_KWH_EX_BTW = 0.0542581;
+  const ENERGIEBIJDRAGE_EUR_PER_KWH_EX_BTW = 0.0019261;
+  const SPECIALE_ACC_EUR_PER_KWH_EX_BTW = 0.0474807;
+  const GEREGULEERD_EUR_PER_KWH_EX_BTW =
+    DISTR_EUR_PER_KWH_EX_BTW +
+    ENERGIEBIJDRAGE_EUR_PER_KWH_EX_BTW +
+    SPECIALE_ACC_EUR_PER_KWH_EX_BTW;
+
+  const eSpot15 = spotEurPerKwh * 1000;
+
+  let koopCentEx = AFNAME_A + (AFNAME_B * eSpot15);
+  let koopCentIn = koopCentEx * BTW_FACTOR;
+  koopCentIn += GROEN_OPTIE_CENT_PER_KWH_INCL_BTW + WKK_KOST_CENT_PER_KWH_INCL_BTW;
+  koopCentIn += (GEREGULEERD_EUR_PER_KWH_EX_BTW * 100) * BTW_FACTOR;
+
+  let verkoopCent = INJECTIE_A + (INJECTIE_B * eSpot15);
+
+  return {
+    buy: koopCentIn / 100,
+    sell: verkoopCent / 100
+  };
+}
+
+function verwerkPrijsData(msg, nuMs) {
+  let q = 0.5;
+  let prijsKoopNu = NaN;
+  let prijsVerkoopNu = NaN;
+  let spotNu = NaN;
+
+  let minToekomstigeSpot = null;
+  let slechtsteToekomstigeVerkoop = null;
+  let besteToekomstigeKoop = null;
+  let toekomstigeNegUren = 0;
+  let urenTotEersteNeg = null;
+
+  let prijsParseDebug = null;
+
+  try {
+    const heeftNordArray =
+      msg.nord &&
+      msg.nord.attributes &&
+      Array.isArray(msg.nord.attributes.data);
+
+    if (heeftNordArray) {
+      const parsed = msg.nord.attributes.data
+        .map(r => {
+          const ts = new Date(r.start_time ?? 0).getTime();
+          const spot = Number(r.price_per_kwh);
+          const contract = spotNaarContractPrijzen(spot);
+
+          return {
+            ts,
+            start_time: r.start_time ?? null,
+            end_time: r.end_time ?? null,
+            spot,
+            buy: contract.buy,
+            sell: contract.sell
+          };
+        })
+        .filter(r => Number.isFinite(r.ts) && Number.isFinite(r.spot))
+        .sort((a, b) => a.ts - b.ts);
+
+      const pnSpot = Number(msg.nord.state);
+      if (Number.isFinite(pnSpot)) {
+        spotNu = pnSpot;
+        const contractNu = spotNaarContractPrijzen(spotNu);
+        prijsKoopNu = contractNu.buy;
+        prijsVerkoopNu = contractNu.sell;
+      }
+
+      const koopReeks = parsed
+        .map(r => r.buy)
+        .filter(Number.isFinite)
+        .sort((a, b) => a - b);
+
+      if (koopReeks.length && Number.isFinite(prijsKoopNu)) {
+        const idx = koopReeks.findIndex(p => p > prijsKoopNu);
+        const i = idx < 0 ? koopReeks.length - 1 : Math.max(0, idx - 1);
+        q = koopReeks.length > 1 ? i / (koopReeks.length - 1) : 0.5;
+      }
+
+      const toekomst = parsed.filter(r => r.ts > nuMs);
+
+      if (toekomst.length) {
+        minToekomstigeSpot = Math.min(...toekomst.map(r => r.spot));
+
+        const verkopen = toekomst.map(r => r.sell).filter(Number.isFinite);
+        const kopen = toekomst.map(r => r.buy).filter(Number.isFinite);
+
+        if (verkopen.length) slechtsteToekomstigeVerkoop = Math.min(...verkopen);
+        if (kopen.length) besteToekomstigeKoop = Math.min(...kopen);
+      }
+
+      const negatieveRijen = toekomst.filter(r => r.spot < 0);
+      toekomstigeNegUren = negatieveRijen.length;
+
+      if (negatieveRijen.length) {
+        const eersteNegTs = Math.min(...negatieveRijen.map(r => r.ts));
+        urenTotEersteNeg = (eersteNegTs - nuMs) / 3600000;
+      }
+
+      prijsParseDebug = {
+        aantalParsed: parsed.length,
+        aantalToekomst: toekomst.length,
+        eersteToekomst: toekomst.length ? toekomst[0].start_time : null,
+        laatsteToekomst: toekomst.length ? toekomst[toekomst.length - 1].start_time : null,
+        minToekomstigeSpot,
+        slechtsteToekomstigeVerkoop,
+        besteToekomstigeKoop,
+        toekomstigeNegUren
+      };
+    } else if (msg.nord && Number.isFinite(Number(msg.nord.state))) {
+      spotNu = Number(msg.nord.state);
+      const contractNu = spotNaarContractPrijzen(spotNu);
+      prijsKoopNu = contractNu.buy;
+      prijsVerkoopNu = contractNu.sell;
+      q = 0.5;
+    }
+  } catch (e) {
+    node.warn(`prijsverwerking mislukt: ${e.message}`);
+    prijsParseDebug = {
+      parseFout: true,
+      bericht: e.message
+    };
+  }
+
+  return {
+    q: begrens(q, 0, 1),
+    prijsKoopNu,
+    prijsVerkoopNu,
+    spotNu,
+    minToekomstigeSpot,
+    slechtsteToekomstigeVerkoop,
+    besteToekomstigeKoop,
+    toekomstigeNegUren,
+    urenTotEersteNeg,
+    prijsParseDebug
+  };
+}
+
+const prijzen = verwerkPrijsData(msg, nuMs);
+
+const q = prijzen.q;
+const prijsKoopNu = prijzen.prijsKoopNu;
+const prijsVerkoopNu = prijzen.prijsVerkoopNu;
+const spotNu = prijzen.spotNu;
+const minToekomstigeSpot = prijzen.minToekomstigeSpot;
+const slechtsteToekomstigeVerkoop = prijzen.slechtsteToekomstigeVerkoop;
+const besteToekomstigeKoop = prijzen.besteToekomstigeKoop;
+const toekomstigeNegUren = prijzen.toekomstigeNegUren;
+const urenTotEersteNeg = prijzen.urenTotEersteNeg;
+
+msg.price_parse_debug = prijzen.prijsParseDebug;
+
+const negMode = Number.isFinite(spotNu) && spotNu < 0;
+const koopNegatiefNu = Number.isFinite(prijsKoopNu) && prijsKoopNu < 0;
+const verkoopNegatiefNu = Number.isFinite(prijsVerkoopNu) && prijsVerkoopNu < 0;
+const exportVermijdenDoorNegatieveVerkoop = verkoopNegatiefNu;
+
+// Veronderstelling: p1 negatief = export, p1 positief = import.
+const ABSORPTIE_DOEL_W = 50;
+const ABSORPTIE_START_W = -150;
+const absorbeerOverschotPv =
+  exportVermijdenDoorNegatieveVerkoop && p1 <= ABSORPTIE_START_W;
+
+/********************************************************************
+ * TIJDSAFHANKELIJKE PLANNER
+ ********************************************************************/
+
+const pv12hBiasKwh = begrens(pv12hW / 4000, 0, 6);
+const pv24hBiasKwh = begrens(pv24hW / 6000, 0, 8);
+
+let morgenGewicht = 0.45;
+if (lateNamiddag) morgenGewicht = 0.15;
+if (avondBijna) morgenGewicht = 0.10;
+if (avond) morgenGewicht = 0.08;
+
+let pv24Gewicht = 0.35;
+if (lateNamiddag) pv24Gewicht = 0.15;
+if (avondBijna) pv24Gewicht = 0.08;
+if (avond) pv24Gewicht = 0.05;
+
+const pvGewogen =
+  (overKwh * 1.00) +
+  (pvMorgen * morgenGewicht) +
+  (pv12hBiasKwh * 0.70) +
+  (pv24hBiasKwh * pv24Gewicht);
+
+let reserveVoorZonKwh = pvGewogen * 0.55;
+reserveVoorZonKwh = begrens(reserveVoorZonKwh, 0, TOTAAL_BRUIKBAAR_KWH * 0.85);
+
+const bat1OpgeslagenKwh =
+  BAT1_USABLE_KWH * begrens((soc1 - BAT1_MIN_SOC_DISCH) / (100 - BAT1_MIN_SOC_DISCH), 0, 1);
+
+const bat2OpgeslagenKwh =
+  BAT2_USABLE_KWH * begrens((soc2 - BAT2_MIN_SOC) / (100 - BAT2_MIN_SOC), 0, 1);
+
+const huidigOpgeslagenKwh = bat1OpgeslagenKwh + bat2OpgeslagenKwh;
+
+let avondReserveKwh = 0;
+if (lateNamiddag) avondReserveKwh = 1.0;
+if (avondBijna) avondReserveKwh = 2.0;
+if (avond) avondReserveKwh = 3.0;
+
+const gewenstMaxOpgeslagenKwh = TOTAAL_BRUIKBAAR_KWH - reserveVoorZonKwh;
+const overtolligeEnergieRuwKwh = huidigOpgeslagenKwh - gewenstMaxOpgeslagenKwh;
+const overtolligeEnergieKwh = Math.max(0, overtolligeEnergieRuwKwh - avondReserveKwh);
+
+const ruimteNodig = overtolligeEnergieKwh > 0.8;
+const veelRuimteNodig = overtolligeEnergieKwh > 2.5;
+const groteZonDag = (overKwh >= 10) || (pvMorgen >= 20) || (pvGewogen >= 8);
+
+let nachtDoelSoc = 90;
+if (pvGewogen >= 18) nachtDoelSoc = 40;
+else if (pvGewogen >= 12) nachtDoelSoc = 55;
+else if (pvGewogen >= 7) nachtDoelSoc = 70;
+else if (pvGewogen >= 4) nachtDoelSoc = 80;
+
+if (toekomstigeNegUren >= 3) nachtDoelSoc = Math.min(nachtDoelSoc, 45);
+else if (toekomstigeNegUren >= 1) nachtDoelSoc = Math.min(nachtDoelSoc, 60);
+
+const verkoopGoedNu = Number.isFinite(prijsVerkoopNu) && prijsVerkoopNu > 0;
+const verkoopRedelijkNu = Number.isFinite(prijsVerkoopNu) && prijsVerkoopNu > 0.02;
+const koopHeelGoedkoop = Number.isFinite(prijsKoopNu) && prijsKoopNu < 0.02;
+
+const laterGoedkoperKopen =
+  Number.isFinite(besteToekomstigeKoop) &&
+  Number.isFinite(prijsKoopNu) &&
+  besteToekomstigeKoop < prijsKoopNu - 0.03;
+
+const laterSlechterVerkopen =
+  Number.isFinite(slechtsteToekomstigeVerkoop) &&
+  Number.isFinite(prijsVerkoopNu) &&
+  slechtsteToekomstigeVerkoop < prijsVerkoopNu - 0.02;
+
+/********************************************************************
+ * NACHTELIJKE ANTI-IMPORT BIJ VEEL ZON MORGEN
+ ********************************************************************/
+
+const zonIsOnder = uur >= 20 || uur < 6;
+
+const genoegVoorNacht =
+  huidigOpgeslagenKwh >= 6.0 || (soc2 >= 85 && soc1 >= 50);
+
+const veelZonMorgen =
+  pvMorgen >= 12 || pvGewogen >= 8 || groteZonDag;
+
+const importPrijsEchtHeelGoedkoop =
+  koopNegatiefNu ||
+  koopHeelGoedkoop ||
+  (Number.isFinite(prijsKoopNu) && prijsKoopNu < 0.12);
+
+const nachtelijkeAntiImportBijVeelZonMorgen =
+  zonIsOnder &&
+  genoegVoorNacht &&
+  veelZonMorgen &&
+  !importPrijsEchtHeelGoedkoop;
+
+/********************************************************************
+ * VOORAF LEEGMAKEN
+ ********************************************************************/
+
+let voorafLeegmaken = false;
+
+if (!negMode && !verkoopNegatiefNu && !nachtelijkeAntiImportBijVeelZonMorgen) {
+  if (veelRuimteNodig && verkoopGoedNu) voorafLeegmaken = true;
+  else if (ruimteNodig && verkoopRedelijkNu && (laterSlechterVerkopen || toekomstigeNegUren >= 1)) voorafLeegmaken = true;
+  else if (!lateNamiddag && groteZonDag && verkoopGoedNu && overtolligeEnergieKwh > 0.5) voorafLeegmaken = true;
+}
+
+if (lateNamiddag && toekomstigeNegUren === 0 && overKwh < 4) {
+  voorafLeegmaken = false;
+}
+
+if (avondBijna && toekomstigeNegUren === 0 && overtolligeEnergieKwh < 2.0) {
+  voorafLeegmaken = false;
+}
+
+if (avond && toekomstigeNegUren === 0 && overKwh < 5) {
+  voorafLeegmaken = false;
+}
+
+const agressiefVoorafLeegmaken =
+  voorafLeegmaken &&
+  (
+    veelRuimteNodig ||
+    toekomstigeNegUren >= 2 ||
+    (laterSlechterVerkopen && overtolligeEnergieKwh > 1.8)
+  );
+
+const ladenBlokkerenDoorVerwachteZon =
+  !koopNegatiefNu &&
+  !exportVermijdenDoorNegatieveVerkoop &&
+  !nachtelijkeAntiImportBijVeelZonMorgen &&
+  (
+    veelRuimteNodig ||
+    (groteZonDag && ruimteNodig) ||
+    reserveVoorZonKwh >= 2.0
+  );
+
+const plannerWilRuimteMaken =
+  veelRuimteNodig || ruimteNodig || groteZonDag;
+
+/********************************************************************
+ * MODI
+ ********************************************************************/
+
+const PIEK_START = 17;
+const PIEK_EIND = 22;
+const inPiek = uur >= PIEK_START && uur < PIEK_EIND;
+
+const cap15W = Number.isFinite(p1q15) ? p1q15 : NaN;
+const capBron = Number.isFinite(p1q15) ? "p1q15" : "geen";
+const capMode = Number.isFinite(cap15W) && cap15W >= CAP_PRETRIGGER_W;
+const capLimiet = CAP_PRETRIGGER_W;
+
+const Q_EXPORT_AAN = 0.80;
+const PV_VERWACHT_MIN_VOOR_EXPORT = 0.05;
+
+const exportToegelaten =
+  !negMode &&
+  !koopNegatiefNu &&
+  !verkoopNegatiefNu &&
+  (q >= Q_EXPORT_AAN || voorafLeegmaken) &&
+  (soc2 >= 60 || soc1 >= 60) &&
+  (overKwh >= PV_VERWACHT_MIN_VOOR_EXPORT);
+
+let nulMode = false;
+let exportMode = false;
+let exportInstapOk = p1 < 600;
+let exportOpnemen = false;
+
+/********************************************************************
+ * BATTERIJ 2
+ ********************************************************************/
+
+const IMPORT_BASIS = 2500;
+const IMPORT_MAX = 2800;
+const RELAX_MAX = 300;
+const STRAKKER_MAX = 2600;
+const NACHT_ANTI_IMPORT_GDES = 0;
+
+const relax = (1 - q) * RELAX_MAX;
+const strakker = q * STRAKKER_MAX;
+const gdesImportRuw = IMPORT_BASIS + relax - strakker;
+
+const soc2Factor = begrens((soc2 - BAT2_MIN_SOC) / 35, 0, 1);
+let importMinDynamisch = nulMode ? 0 : Math.round(1600 - soc2Factor * 600);
+
+if (nachtelijkeAntiImportBijVeelZonMorgen) {
+  importMinDynamisch = 0;
+}
+
+let gdesImport = begrens(Math.round(gdesImportRuw), importMinDynamisch, IMPORT_MAX);
+
+if (koopNegatiefNu) {
+  gdesImport = IMPORT_MAX;
+} else if (absorbeerOverschotPv) {
+  gdesImport = ABSORPTIE_DOEL_W;
+} else if (exportVermijdenDoorNegatieveVerkoop && !absorbeerOverschotPv) {
+  gdesImport = 0;
+}
+
+let gdesVoorafLeeg = 0;
+if (overtolligeEnergieKwh > 4) gdesVoorafLeeg = -2200;
+else if (overtolligeEnergieKwh > 2.5) gdesVoorafLeeg = -1800;
+else if (overtolligeEnergieKwh > 1.5) gdesVoorafLeeg = -1200;
+else if (overtolligeEnergieKwh > 0.8) gdesVoorafLeeg = -600;
+
+if (Number.isFinite(prijsVerkoopNu) && prijsVerkoopNu > 0.05 && gdesVoorafLeeg < 0) {
+  gdesVoorafLeeg -= 150;
+}
+gdesVoorafLeeg = begrens(Math.round(gdesVoorafLeeg), -2400, 0);
+
+let gewensteGdes;
+if (koopNegatiefNu) gewensteGdes = IMPORT_MAX;
+else if (absorbeerOverschotPv) gewensteGdes = ABSORPTIE_DOEL_W;
+else if (exportVermijdenDoorNegatieveVerkoop && !absorbeerOverschotPv) gewensteGdes = 0;
+else if (nachtelijkeAntiImportBijVeelZonMorgen) gewensteGdes = NACHT_ANTI_IMPORT_GDES;
+else if (agressiefVoorafLeegmaken) gewensteGdes = gdesVoorafLeeg;
+else if (voorafLeegmaken) gewensteGdes = gdesVoorafLeeg;
+else gewensteGdes = gdesImport;
+
+let gdesVorige = context.get("gdesPrev");
+if (!Number.isFinite(gdesVorige)) gdesVorige = gewensteGdes;
+
+const gdesSlew = (agressiefVoorafLeegmaken || voorafLeegmaken) ? 400 : 200;
+const gdesStap = begrens(gewensteGdes - gdesVorige, -gdesSlew, gdesSlew);
+let gdes = Math.round(gdesVorige + gdesStap);
+context.set("gdesPrev", gdes);
+
+let blo;
+let bup;
+let bat2LadenGeblokkeerd = false;
+let redenBlokkeringBat2Laden = null;
+
+if (koopNegatiefNu) {
+  blo = -200;
+  bup = BAT2_MAX_CHARGE;
+} else if (absorbeerOverschotPv) {
+  blo = -200;
+  bup = BAT2_MAX_CHARGE;
+} else if (exportVermijdenDoorNegatieveVerkoop && !absorbeerOverschotPv) {
+  blo = -200;
+  bup = -1;
+} else if (agressiefVoorafLeegmaken || voorafLeegmaken) {
+  if (gdes < 0) {
+    blo = -Math.round(begrens(Math.abs(gdes) + 500, 1200, 3200));
+    bup = -1;
+  } else {
+    blo = -200;
+    bup = -1;
+  }
+} else {
+  blo = -200;
+
+  const basisLadenToegelaten =
+    nachtUren
+      ? ((soc2 < nachtDoelSoc) && !laterGoedkoperKopen && (q < 0.35 || koopHeelGoedkoop))
+      : (q < 0.30 || koopHeelGoedkoop);
+
+  let nuLadenToegelaten = basisLadenToegelaten;
+
+  if (ladenBlokkerenDoorVerwachteZon) {
+    nuLadenToegelaten = false;
+    bat2LadenGeblokkeerd = true;
+
+    if (veelRuimteNodig) {
+      redenBlokkeringBat2Laden = "Bat2 laden geblokkeerd omdat dringend opslagruimte nodig is voor verwachte zonnestroom";
+    } else if (groteZonDag && ruimteNodig) {
+      redenBlokkeringBat2Laden = "Bat2 laden geblokkeerd omdat veel zonnestroom verwacht wordt en extra ruimte nodig is";
+    } else {
+      redenBlokkeringBat2Laden = "Bat2 laden geblokkeerd om ruimte te bewaren voor verwachte zonnestroom";
+    }
+  }
+
+  bup = nuLadenToegelaten ? BAT2_MAX_CHARGE : -1;
+}
+
+if (nachtelijkeAntiImportBijVeelZonMorgen && !koopNegatiefNu) {
+  bup = -1;
+}
+
+blo = begrens(Math.round(blo), -5000, 0);
+bup = begrens(Math.round(bup), -1, BAT2_MAX_CHARGE);
+
+/********************************************************************
+ * BATTERIJ 1
+ ********************************************************************/
+
+let bat1Cmd = 0;
+
+const goedkoop = q < 0.35;
+const duur = q > 0.70;
+const bat1MagOntladen = soc1 > BAT1_MIN_SOC_DISCH + 2;
+const voorafLeegBat1HulpNodig = p1 > -900;
+
+const bat1OntladenToegelaten = bat1MagOntladen && !soc1Ontbreekt;
+const bat1MoetAbsorberenBijNegatieveVerkoop =
+  absorbeerOverschotPv && soc1 < 100 && !soc1Ontbreekt;
+
+if (koopNegatiefNu) {
+  bat1Cmd = 0;
+} else if (exportVermijdenDoorNegatieveVerkoop) {
+  bat1Cmd = 0;
+} else if ((agressiefVoorafLeegmaken || voorafLeegmaken) && bat1OntladenToegelaten && voorafLeegBat1HulpNodig) {
+  let voorafLeegOntladen = 0;
+  if (overtolligeEnergieKwh > 2.5) voorafLeegOntladen = 800;
+  else if (overtolligeEnergieKwh > 1.5) voorafLeegOntladen = 500;
+  else if (overtolligeEnergieKwh > 0.8) voorafLeegOntladen = 250;
+
+  bat1Cmd = begrens(voorafLeegOntladen, 0, BAT1_MAX_DISCH);
+} else if (bat1OntladenToegelaten) {
+  let ontlaadWens = 0;
+
+  if (capMode) ontlaadWens += 900;
+
+  const doel = gdesImport;
+  const overschot = p1 - (doel + 120);
+  if (overschot > 150) ontlaadWens += overschot * 0.8;
+  if (duur && !nachtelijkeAntiImportBijVeelZonMorgen) ontlaadWens += 300;
+
+  ontlaadWens = begrens(ontlaadWens, 0, BAT1_MAX_DISCH);
+  if (ontlaadWens > BAT1_MIN_ACTION) bat1Cmd = ontlaadWens;
+}
+
+if (bat1Cmd === 0 && soc1 < 100 && !soc1Ontbreekt) {
+  const p1Limiet = Math.min(gdes + 150, capLimiet);
+  const ruimte = Math.max(0, p1Limiet - p1);
+
+  let laadWens = 0;
+
+  const bat1NachtLadenToegelaten = !nachtUren || (soc1 < nachtDoelSoc);
+
+  const bat1MagLadenOpPrijs =
+    koopNegatiefNu ||
+    bat1MoetAbsorberenBijNegatieveVerkoop ||
+    (
+      !voorafLeegmaken &&
+      !exportMode &&
+      p1 > -800 &&
+      bat1NachtLadenToegelaten &&
+      !laterGoedkoperKopen &&
+      (goedkoop || koopHeelGoedkoop)
+    );
+
+  const bat1LadenGeblokkeerdDoorZon =
+    ladenBlokkerenDoorVerwachteZon && !koopNegatiefNu && !exportVermijdenDoorNegatieveVerkoop;
+
+  const bat1MoetLaden =
+    bat1MagLadenOpPrijs &&
+    !bat1LadenGeblokkeerdDoorZon &&
+    !nachtelijkeAntiImportBijVeelZonMorgen &&
+    !(exportVermijdenDoorNegatieveVerkoop && !absorbeerOverschotPv);
+
+  if (bat1MoetLaden) {
+    if (koopNegatiefNu) laadWens = BAT1_MAX_CHARGE;
+    else if (bat1MoetAbsorberenBijNegatieveVerkoop) laadWens = BAT1_MAX_CHARGE;
+    else if (goedkoop) laadWens = 400 + ruimte * 0.85;
+    else laadWens = ruimte * 0.6;
+  } else if (!duur) {
+    if (!ruimteNodig && overKwh < 4 && !bat1LadenGeblokkeerdDoorZon && !nachtelijkeAntiImportBijVeelZonMorgen) {
+      laadWens = ruimte * 0.35;
+    }
+  }
+
+  const bat1LaadConflict =
+    voorafLeegmaken ||
+    exportMode ||
+    nachtelijkeAntiImportBijVeelZonMorgen ||
+    (exportVermijdenDoorNegatieveVerkoop && !absorbeerOverschotPv) ||
+    (ruimteNodig && !exportVermijdenDoorNegatieveVerkoop) ||
+    p1 < -800 ||
+    (verkoopNegatiefNu && !bat1MoetAbsorberenBijNegatieveVerkoop) ||
+    bat1LadenGeblokkeerdDoorZon;
+
+  const BAT1_LAAD_SLEW = 250;
+  let bat1LaadVorige = context.get("bat1ChPrev");
+  if (!Number.isFinite(bat1LaadVorige)) bat1LaadVorige = 0;
+
+  if (bat1LaadConflict && !koopNegatiefNu && !bat1MoetAbsorberenBijNegatieveVerkoop) {
+    laadWens = 0;
+    bat1LaadVorige = 0;
+    context.set("bat1ChPrev", 0);
+  } else {
+    laadWens = begrens(laadWens, 0, BAT1_MAX_CHARGE);
+    const d = begrens(laadWens - bat1LaadVorige, -BAT1_LAAD_SLEW, BAT1_LAAD_SLEW);
+    bat1LaadVorige += d;
+    context.set("bat1ChPrev", bat1LaadVorige);
+  }
+
+  if (bat1LaadVorige > BAT1_MIN_ACTION) {
+    bat1Cmd = -bat1LaadVorige;
+  }
+}
+
+bat1Cmd = begrens(bat1Cmd, -BAT1_MAX_CHARGE, BAT1_MAX_DISCH);
+if (Math.abs(bat1Cmd) < BAT1_MIN_ACTION) bat1Cmd = 0;
+
+const laad1 = bat1Cmd < 0 ? Math.round(-bat1Cmd) : 0;
+const ontlaad1 = bat1Cmd > 0 ? Math.round(bat1Cmd) : 0;
+
+/********************************************************************
+ * KLEINE PV CURTAILMENT
+ ********************************************************************/
+
+const CURTAIL_MARGIN_W = 80;
+const CURTAIL_START_EXPORT_W = -60;
+const CURTAIL_RELEASE_IMPORT_W = 120;
+
+let pv2Cmd = PV2_MAX_W;
+let pvCurtailActief = false;
+let pvCurtailReden = "Kleine PV volledig vrijgegeven";
+
+const bat1LaadtNu = laad1 > 0;
+const bat2LaadtNu = bup > 0 && gdes >= 0;
+const batterijenNemenOp =
+  bat1LaadtNu || bat2LaadtNu || absorbeerOverschotPv;
+
+const exportOngewenst =
+  verkoopNegatiefNu || !exportToegelaten;
+
+const nettoInjectieNu = p1 <= CURTAIL_START_EXPORT_W;
+const lichteImportNu = p1 >= CURTAIL_RELEASE_IMPORT_W;
+
+if (pv2Nu <= 0) {
+  pv2Cmd = PV2_MAX_W;
+  pvCurtailActief = false;
+  pvCurtailReden = "Geen kleine PV-productie gemeten";
+} else if (!exportOngewenst) {
+  pv2Cmd = PV2_MAX_W;
+  pvCurtailActief = false;
+  pvCurtailReden = "Export is toegestaan, kleine PV blijft vrij";
+} else {
+  let gewenstPv2 = PV2_MAX_W;
+
+  if (nettoInjectieNu) {
+    const injectieW = Math.abs(Math.min(p1, 0));
+    const teKnijpenW = injectieW + CURTAIL_MARGIN_W;
+    gewenstPv2 = Math.max(0, PV2_MAX_W - teKnijpenW);
+  } else if (!batterijenNemenOp && !lichteImportNu) {
+    gewenstPv2 = Math.max(0, PV2_MAX_W - PV2_MARGIN_NEG);
+  }
+
+  let pv2Vorige = context.get("pv2Prev");
+  if (!Number.isFinite(pv2Vorige)) pv2Vorige = PV2_MAX_W;
+
+  const pv2Stap = begrens(gewenstPv2 - pv2Vorige, -PV2_SLEW, PV2_SLEW);
+  pv2Cmd = Math.round(pv2Vorige + pv2Stap);
+  pv2Cmd = begrens(pv2Cmd, 0, PV2_MAX_W);
+
+  context.set("pv2Prev", pv2Cmd);
+
+  pvCurtailActief = pv2Cmd < PV2_MAX_W;
+
+  if (pvCurtailActief) {
+    if (verkoopNegatiefNu && nettoInjectieNu) {
+      pvCurtailReden = "Kleine PV wordt begrensd om export bij negatieve verkoopprijs te vermijden";
+    } else if (!exportToegelaten && nettoInjectieNu) {
+      pvCurtailReden = "Kleine PV wordt begrensd omdat export nu niet toegestaan is";
+    } else if (!batterijenNemenOp) {
+      pvCurtailReden = "Kleine PV wordt preventief begrensd omdat batterijen geen overschot opnemen";
+    } else {
+      pvCurtailReden = "Kleine PV wordt begrensd om netto-injectie te beperken";
+    }
+  } else {
+    if (batterijenNemenOp) {
+      pvCurtailReden = "Kleine PV blijft vrij omdat batterijen het overschot opnemen";
+    } else {
+      pvCurtailReden = "Kleine PV blijft vrij omdat er geen netto-injectie is";
+    }
+  }
+}
+
+/********************************************************************
+ * LEESBARE REDENEN
+ ********************************************************************/
+
+function redenBat1(ctx) {
+  const {
+    koopNegatiefNu,
+    exportVermijdenDoorNegatieveVerkoop,
+    absorbeerOverschotPv,
+    voorafLeegmaken,
+    agressiefVoorafLeegmaken,
+    capMode,
+    duur,
+    goedkoop,
+    koopHeelGoedkoop,
+    ruimteNodig,
+    overKwh,
+    soc1Ontbreekt,
+    laad1,
+    ontlaad1,
+    ladenBlokkerenDoorVerwachteZon,
+    nachtelijkeAntiImportBijVeelZonMorgen
+  } = ctx;
+
+  if (soc1Ontbreekt) {
+    return "Bat1 is beperkt omdat SOC1 ontbreekt; veilige modus actief";
+  }
+
+  if (laad1 > 0) {
+    if (absorbeerOverschotPv) {
+      return "Bat1 laadt om actueel overschot-zonnestroom op te nemen bij negatieve verkoopprijs";
+    }
+    if (koopNegatiefNu) return "Bat1 laadt omdat de aankoopprijs negatief is";
+    if (koopHeelGoedkoop) return "Bat1 laadt omdat stroom nu zeer goedkoop is";
+    if (goedkoop) return "Bat1 laadt omdat stroom goedkoop is";
+    if (!ruimteNodig && overKwh < 4) {
+      return "Bat1 laadt licht omdat er voldoende ruimte is en weinig zonnestroom verwacht wordt";
+    }
+    return "Bat1 laadt";
+  }
+
+  if (ontlaad1 > 0) {
+    if (agressiefVoorafLeegmaken || voorafLeegmaken) {
+      return "Bat1 ontlaadt om plaats te maken voor verwachte zonnestroom";
+    }
+    if (capMode) {
+      return "Bat1 ontlaadt om piekverbruik te beperken";
+    }
+    if (duur && !nachtelijkeAntiImportBijVeelZonMorgen) {
+      return "Bat1 ontlaadt omdat stroom nu duur is";
+    }
+    if (nachtelijkeAntiImportBijVeelZonMorgen) {
+      return "Bat1 helpt de nacht op batterij door te komen zodat morgen ruimte overblijft voor zonnestroom";
+    }
+    return "Bat1 ontlaadt om netafname te verlagen";
+  }
+
+  if (ladenBlokkerenDoorVerwachteZon) {
+    return "Bat1 wacht om opslagruimte vrij te houden voor verwachte zonnestroom";
+  }
+  if (nachtelijkeAntiImportBijVeelZonMorgen) {
+    return "Bat1 wacht of ondersteunt de nachtmodus zonder netimport omdat morgen veel zon verwacht wordt";
+  }
+  if (exportVermijdenDoorNegatieveVerkoop && !absorbeerOverschotPv) {
+    return "Bat1 wacht op werkelijk PV-overschot om onnodige netimport te vermijden";
+  }
+  if (koopNegatiefNu) {
+    return "Bat1 wacht; de negatieve prijs wordt vooral benut via de laadstrategie";
+  }
+  if (voorafLeegmaken) {
+    return "Bat1 wacht ondanks vooraf leegmaken omdat extra hulp nu niet nodig is";
+  }
+  return "Bat1 doet niets";
+}
+
+function redenBat2(ctx) {
+  const {
+    koopNegatiefNu,
+    exportVermijdenDoorNegatieveVerkoop,
+    absorbeerOverschotPv,
+    voorafLeegmaken,
+    agressiefVoorafLeegmaken,
+    gdes,
+    gewensteGdes,
+    bup,
+    nachtUren,
+    q,
+    koopHeelGoedkoop,
+    laterGoedkoperKopen,
+    bat2LadenGeblokkeerd,
+    redenBlokkeringBat2Laden,
+    nachtelijkeAntiImportBijVeelZonMorgen
+  } = ctx;
+
+  if (koopNegatiefNu) {
+    return "Bat2 laadt omdat de aankoopprijs negatief is";
+  }
+
+  if (absorbeerOverschotPv && (bup > 0 || gdes >= 0)) {
+    return "Bat2 laadt om actueel overschot-zonnestroom op te nemen bij negatieve verkoopprijs";
+  }
+
+  if (exportVermijdenDoorNegatieveVerkoop && !absorbeerOverschotPv) {
+    return "Bat2 wacht op werkelijk PV-overschot om onnodige netimport te vermijden";
+  }
+
+  if (nachtelijkeAntiImportBijVeelZonMorgen) {
+    return "Bat2 houdt netimport op nul omdat de nacht op batterij kan en morgen veel zon verwacht wordt";
+  }
+
+  if (bat2LadenGeblokkeerd && redenBlokkeringBat2Laden) {
+    return redenBlokkeringBat2Laden;
+  }
+
+  if ((agressiefVoorafLeegmaken || voorafLeegmaken) && gdes < 0) {
+    return "Bat2 ontlaadt om plaats te maken voor verwachte zonnestroom";
+  }
+
+  if (bup > 0) {
+    if (koopHeelGoedkoop) return "Bat2 laadt omdat stroom zeer goedkoop is";
+    if (nachtUren && !laterGoedkoperKopen && q < 0.35) {
+      return "Bat2 laadt 's nachts omdat de prijs gunstig is en later geen goedkopere prijs verwacht wordt";
+    }
+    if (q < 0.30) return "Bat2 laadt omdat de huidige prijs relatief laag is";
+    return "Bat2 laadt";
+  }
+
+  if (gewensteGdes >= 0) {
+    return "Bat2 volgt het importdoel en houdt reserve aan";
+  }
+
+  if (gdes < 0) {
+    return "Bat2 ontlaadt volgens het ingestelde vermogensdoel";
+  }
+
+  return "Bat2 doet niets";
+}
+
+function plannerReden(ctx) {
+  const {
+    veiligGefaald,
+    beideSocOntbreken,
+    koopNegatiefNu,
+    exportVermijdenDoorNegatieveVerkoop,
+    absorbeerOverschotPv,
+    voorafLeegmaken,
+    agressiefVoorafLeegmaken,
+    ruimteNodig,
+    veelRuimteNodig,
+    groteZonDag,
+    capMode,
+    negMode,
+    nachtelijkeAntiImportBijVeelZonMorgen
+  } = ctx;
+
+  if (veiligGefaald) return "Veilige foutmodus actief";
+  if (beideSocOntbreken) return "Veilige foutmodus actief door ontbrekende SOC-metingen";
+  if (nachtelijkeAntiImportBijVeelZonMorgen) return "Planner activeert nachtmodus zonder netimport omdat morgen veel zon verwacht wordt";
+  if (absorbeerOverschotPv) return "Planner wil overschot-zonnestroom lokaal opnemen om export bij negatieve verkoopprijs te vermijden";
+  if (exportVermijdenDoorNegatieveVerkoop) return "Planner vermijdt export bij negatieve verkoopprijs, maar forceert geen netladen zonder overschot";
+  if (koopNegatiefNu) return "Planner wil laden omdat de aankoopprijs negatief is";
+  if (agressiefVoorafLeegmaken) return "Planner wil agressief plaats maken voor verwachte zonnestroom";
+  if (voorafLeegmaken) return "Planner wil plaats maken voor verwachte zonnestroom";
+  if (capMode) return "Planner wil piekverbruik beperken";
+  if (veelRuimteNodig) return "Planner ziet dat dringend opslagruimte vrijgemaakt moet worden";
+  if (ruimteNodig) return "Planner ziet dat opslagruimte nodig is voor komende zonnestroom";
+  if (groteZonDag) return "Planner houdt rekening met veel verwachte zonnestroom";
+  if (negMode) return "Planner ziet een negatieve spotprijs";
+  return "Planner werkt in normale regelmodus";
+}
+
+function actieReden(ctx) {
+  const {
+    koopNegatiefNu,
+    exportVermijdenDoorNegatieveVerkoop,
+    absorbeerOverschotPv,
+    laad1,
+    ontlaad1,
+    gdes,
+    bup,
+    bat2LadenGeblokkeerd,
+    ladenBlokkerenDoorVerwachteZon,
+    voorafLeegmaken,
+    agressiefVoorafLeegmaken,
+    pvCurtailActief,
+    nachtelijkeAntiImportBijVeelZonMorgen
+  } = ctx;
+
+  if (nachtelijkeAntiImportBijVeelZonMorgen) {
+    return "Werkelijke actie: systeem vermijdt netimport vannacht zodat morgen meer zonnestroom benut kan worden";
+  }
+
+  if (absorbeerOverschotPv) {
+    if (pvCurtailActief) {
+      return "Werkelijke actie: systeem neemt PV-overschot op en begrenst de kleine PV waar nodig";
+    }
+    return "Werkelijke actie: systeem probeert actueel PV-overschot op te nemen zonder onnodige netimport";
+  }
+
+  if (exportVermijdenDoorNegatieveVerkoop) {
+    if (pvCurtailActief) {
+      return "Werkelijke actie: export vermijden is actief en de kleine PV wordt begrensd om injectie te voorkomen";
+    }
+    return "Werkelijke actie: export vermijden is actief, maar laden wacht tot er effectief overschot is";
+  }
+
+  if (koopNegatiefNu) {
+    return "Werkelijke actie: laden is toegestaan omdat de aankoopprijs negatief is";
+  }
+
+  if (ontlaad1 > 0 || gdes < 0 || voorafLeegmaken || agressiefVoorafLeegmaken) {
+    return "Werkelijke actie: ontladen of ruimte maken heeft voorrang";
+  }
+
+  if (bat2LadenGeblokkeerd || ladenBlokkerenDoorVerwachteZon) {
+    return "Werkelijke actie: netladen is geblokkeerd om ruimte te bewaren voor verwachte zonnestroom";
+  }
+
+  if (laad1 > 0 || bup > 0) {
+    return "Werkelijke actie: laden is toegestaan volgens prijslogica";
+  }
+
+  return "Werkelijke actie: geen actieve laad- of ontlaadactie";
+}
+
+const bat1Reden = redenBat1({
+  koopNegatiefNu,
+  exportVermijdenDoorNegatieveVerkoop,
+  absorbeerOverschotPv,
+  voorafLeegmaken,
+  agressiefVoorafLeegmaken,
+  capMode,
+  duur,
+  goedkoop,
+  koopHeelGoedkoop,
+  ruimteNodig,
+  overKwh,
+  soc1Ontbreekt,
+  laad1,
+  ontlaad1,
+  ladenBlokkerenDoorVerwachteZon,
+  nachtelijkeAntiImportBijVeelZonMorgen
+});
+
+const bat2Reden = redenBat2({
+  koopNegatiefNu,
+  exportVermijdenDoorNegatieveVerkoop,
+  absorbeerOverschotPv,
+  voorafLeegmaken,
+  agressiefVoorafLeegmaken,
+  gdes,
+  gewensteGdes,
+  bup,
+  nachtUren,
+  q,
+  koopHeelGoedkoop,
+  laterGoedkoperKopen,
+  bat2LadenGeblokkeerd,
+  redenBlokkeringBat2Laden,
+  nachtelijkeAntiImportBijVeelZonMorgen
+});
+
+const plannerUitleg = plannerReden({
+  veiligGefaald: false,
+  beideSocOntbreken,
+  koopNegatiefNu,
+  exportVermijdenDoorNegatieveVerkoop,
+  absorbeerOverschotPv,
+  voorafLeegmaken,
+  agressiefVoorafLeegmaken,
+  ruimteNodig,
+  veelRuimteNodig,
+  groteZonDag,
+  capMode,
+  negMode,
+  nachtelijkeAntiImportBijVeelZonMorgen
+});
+
+const actieUitleg = actieReden({
+  koopNegatiefNu,
+  exportVermijdenDoorNegatieveVerkoop,
+  absorbeerOverschotPv,
+  laad1,
+  ontlaad1,
+  gdes,
+  bup,
+  bat2LadenGeblokkeerd,
+  ladenBlokkerenDoorVerwachteZon,
+  voorafLeegmaken,
+  agressiefVoorafLeegmaken,
+  pvCurtailActief,
+  nachtelijkeAntiImportBijVeelZonMorgen
+});
+
+/********************************************************************
+ * MENSELIJKE STATUSREGEL
+ ********************************************************************/
+
+let korteStatus = "Normale regeling";
+
+if (beideSocOntbreken) korteStatus = "Veilige foutmodus: SOC ontbreekt";
+else if (nachtelijkeAntiImportBijVeelZonMorgen) korteStatus = "Nachtmodus zonder netimport";
+else if (absorbeerOverschotPv) korteStatus = "PV-overschot opnemen om export te vermijden";
+else if (exportVermijdenDoorNegatieveVerkoop) korteStatus = "Export vermijden zonder netladen";
+else if (koopNegatiefNu) korteStatus = "Laden door negatieve prijs";
+else if (agressiefVoorafLeegmaken) korteStatus = "Agressief ontladen voor zonnestroom";
+else if (voorafLeegmaken) korteStatus = "Ontladen om plaats te maken";
+else if (ladenBlokkerenDoorVerwachteZon) korteStatus = "Netladen geblokkeerd voor zonnestroom";
+else if (capMode) korteStatus = "Piekbegrenzing actief";
+
+const bat1Kort =
+  laad1 > 0 ? `Bat1 laadt ${Math.round(laad1)}W` :
+  ontlaad1 > 0 ? `Bat1 ontlaadt ${Math.round(ontlaad1)}W` :
+  "Bat1 stil";
+
+const bat2Kort =
+  absorbeerOverschotPv ? `Bat2 opnemen tot ${Math.round(bup)}W` :
+  koopNegatiefNu ? `Bat2 laden tot ${Math.round(bup)}W` :
+  nachtelijkeAntiImportBijVeelZonMorgen ? `Bat2 doel ${Math.round(gdes)}W` :
+  gdes < 0 ? `Bat2 ontladen ${Math.abs(Math.round(gdes))}W` :
+  bup > 0 ? `Bat2 laden toegestaan` :
+  `Bat2 doel ${Math.round(gdes)}W`;
+
+node.status({
+  fill: beideSocOntbreken ? "red" : nachtelijkeAntiImportBijVeelZonMorgen ? "blue" : absorbeerOverschotPv ? "blue" : exportVermijdenDoorNegatieveVerkoop ? "grey" : voorafLeegmaken ? "yellow" : koopNegatiefNu ? "green" : ladenBlokkerenDoorVerwachteZon ? "blue" : "grey",
+  shape: "dot",
+  text: `${korteStatus} | ${bat1Kort} | ${bat2Kort}`
+});
+
+/********************************************************************
+ * DEBUG
+ ********************************************************************/
+
+const debug = {
+  samenvatting: {
+    plannerStatus: plannerUitleg,
+    actieStatus: actieUitleg,
+    bat1Status:
+      laad1 > 0 ? `Bat1 laadt met ${formatW(laad1)}` :
+      ontlaad1 > 0 ? `Bat1 ontlaadt met ${formatW(ontlaad1)}` :
+      "Bat1 staat stil",
+    bat2Status:
+      gdes < 0 ? `Bat2 ontlaadt met doel ${formatW(Math.abs(gdes))}` :
+      bup > 0 ? `Bat2 mag laden tot ${formatW(bup)}` :
+      `Bat2 volgt importdoel ${formatW(gdes)}`,
+    kleinePvStatus:
+      pvCurtailActief
+        ? `Kleine PV begrensd tot ${formatW(pv2Cmd)}`
+        : "Kleine PV volledig vrij",
+    bat1Reden,
+    bat2Reden,
+    kleinePvReden: pvCurtailReden
+  },
+
+  energie: {
+    soc1: formatPct(soc1),
+    soc2: formatPct(soc2),
+    bat1Opgeslagen: formatKwh(bat1OpgeslagenKwh),
+    bat2Opgeslagen: formatKwh(bat2OpgeslagenKwh),
+    totaalOpgeslagen: formatKwh(huidigOpgeslagenKwh),
+    reserveVoorZon: formatKwh(reserveVoorZonKwh),
+    overtolligeEnergie: formatKwh(overtolligeEnergieKwh),
+    avondReserve: formatKwh(avondReserveKwh),
+    nachtDoelSoc: formatPct(nachtDoelSoc)
+  },
+
+  markt: {
+    spotNu: Number.isFinite(spotNu) ? spotNu : null,
+    koopPrijsNu: Number.isFinite(prijsKoopNu) ? prijsKoopNu : null,
+    verkoopPrijsNu: Number.isFinite(prijsVerkoopNu) ? prijsVerkoopNu : null,
+    prijsNiveauQ: vastGetalVeilig(q, 3, 0.5),
+    toekomstigeNegatieveUren: toekomstigeNegUren,
+    urenTotEersteNegatievePrijs: vastGetalVeilig(urenTotEersteNeg, 2, null),
+    besteToekomstigeKoop,
+    slechtsteToekomstigeVerkoop,
+    minToekomstigeSpot
+  },
+
+  voorspelling: {
+    resterendeZonVandaagKwh: vastGetalVeilig(overKwh, 2, 0),
+    zonMorgenKwh: vastGetalVeilig(pvMorgen, 2, 0),
+    pv12hBiasKwh: vastGetalVeilig(pv12hBiasKwh, 2, 0),
+    pv24hBiasKwh: vastGetalVeilig(pv24hBiasKwh, 2, 0),
+    pvGewogenKwh: vastGetalVeilig(pvGewogen, 2, 0),
+    groteZonDag,
+    genoegVoorNacht,
+    veelZonMorgen
+  },
+
+  regeling: {
+    p1: formatW(p1),
+    capMode,
+    cap15W: Number.isFinite(cap15W) ? formatW(cap15W) : null,
+    capBron,
+    capTargetW: CAP_TARGET_W,
+    capPretriggerW: CAP_PRETRIGGER_W,
+    gewensteGdes: formatW(gewensteGdes),
+    gdes: formatW(gdes),
+    blo: formatW(blo),
+    bup: bup === -1 ? "blokkeren" : formatW(bup),
+    pv2Nu: formatW(pv2Nu),
+    pv2Cmd: formatW(pv2Cmd),
+    pvCurtailActief
+  },
+
+  batterijen: {
+    bat1: {
+      status:
+        laad1 > 0 ? "laden" :
+        ontlaad1 > 0 ? "ontladen" :
+        "stil",
+      vermogenW:
+        laad1 > 0 ? laad1 :
+        ontlaad1 > 0 ? ontlaad1 :
+        0,
+      richting:
+        laad1 > 0 ? "in" :
+        ontlaad1 > 0 ? "uit" :
+        "geen",
+      soc: Math.round(soc1),
+      energieKwh: vastGetalVeilig(bat1OpgeslagenKwh, 2, null),
+      reden: bat1Reden,
+      maxLaadvermogenCfg: BAT1_MAX_CHARGE
+    },
+    bat2: {
+      status:
+        nachtelijkeAntiImportBijVeelZonMorgen ? "nachtmodus_geen_import" :
+        absorbeerOverschotPv ? "laden_om_pv_overschot_op_te_nemen" :
+        exportVermijdenDoorNegatieveVerkoop ? "wachten_op_werkelijk_overschot" :
+        koopNegatiefNu ? "laden_negatieve_prijs" :
+        bat2LadenGeblokkeerd ? "laden_geblokkeerd_voor_zon" :
+        bup > 0 ? "laden_toegelaten" :
+        gdes < 0 ? "ontladen" :
+        "regeling_normaal",
+      gdesW: gdes,
+      bloW: blo,
+      bupW: bup,
+      soc: Math.round(soc2),
+      energieKwh: vastGetalVeilig(bat2OpgeslagenKwh, 2, null),
+      reden: bat2Reden,
+      minSoc: BAT2_MIN_SOC
+    }
+  },
+
+  beslissingen: {
+    plannerWilRuimteMaken,
+    ladenBlokkerenDoorVerwachteZon,
+    bat2LadenGeblokkeerd,
+    redenBlokkeringBat2Laden,
+    exportVermijdenDoorNegatieveVerkoop,
+    absorbeerOverschotPv,
+    absorptieDoelW: ABSORPTIE_DOEL_W,
+    absorptieStartW: ABSORPTIE_START_W,
+    pvCurtailActief,
+    pvCurtailReden,
+    nachtelijkeAntiImportBijVeelZonMorgen,
+    genoegVoorNacht,
+    veelZonMorgen,
+    importPrijsEchtHeelGoedkoop,
+    nachtAntiImportGdes: NACHT_ANTI_IMPORT_GDES
+  },
+
+  sensoren: {
+    soc1Ontbreekt,
+    soc2Ontbreekt
+  },
+
+  intern: {
+    negMode,
+    koopNegatiefNu,
+    verkoopNegatiefNu,
+    voorafLeegmaken,
+    agressiefVoorafLeegmaken,
+    ruimteNodig,
+    veelRuimteNodig,
+    laterGoedkoperKopen,
+    laterSlechterVerkopen,
+    exportToegelaten,
+    exportMode,
+    exportInstapOk,
+    exportOpnemen,
+    nulMode,
+    inPiek,
+    pv2Nu,
+    pv2Cmd,
+    pv2MaxW: PV2_MAX_W,
+    pv2Slew: PV2_SLEW,
+    pv2MarginNeg: PV2_MARGIN_NEG,
+    curtailMarginW: CURTAIL_MARGIN_W,
+    curtailStartExportW: CURTAIL_START_EXPORT_W,
+    curtailReleaseImportW: CURTAIL_RELEASE_IMPORT_W,
+    prijsParseDebug: msg.price_parse_debug ?? null
+  }
+};
+
+/********************************************************************
+ * UITGANGEN
+ ********************************************************************/
+
+const uit1 = gewijzigd("ha_bat1_charge", laad1, 10)
+  ? { topic: "charge", payload: laad1, charge: laad1, ...debug }
+  : null;
+
+const uit2 = gewijzigd("ha_bat1_discharge", ontlaad1, 10)
+  ? { topic: "discharge", payload: ontlaad1, discharge: ontlaad1, ...debug }
+  : null;
+
+const uit3 = gewijzigd("ha_gdes", gdes, 10)
+  ? { topic: "sofar_gdes_w", payload: gdes, ...debug }
+  : null;
+
+const uit4 = gewijzigd("ha_blo", blo, 10)
+  ? { topic: "sofar_blo_w", payload: blo, ...debug }
+  : null;
+
+const uit5 = gewijzigd("ha_bup", bup, 10)
+  ? { topic: "sofar_bup_w", payload: bup, ...debug }
+  : null;
+
+const uit6 = {
+  topic: "debug",
+  payload: {
+    ts: new Date().toISOString(),
+
+    planner: plannerUitleg,
+    actie: actieUitleg,
+
+    bat1: {
+      status:
+        laad1 > 0 ? "laden" :
+        ontlaad1 > 0 ? "ontladen" :
+        "stil",
+      vermogen_w:
+        laad1 > 0 ? laad1 :
+        ontlaad1 > 0 ? ontlaad1 :
+        0,
+      richting:
+        laad1 > 0 ? "in" :
+        ontlaad1 > 0 ? "uit" :
+        "geen",
+      soc_pct: Math.round(soc1),
+      energie_kwh: vastGetalVeilig(bat1OpgeslagenKwh, 2, null),
+      reden: bat1Reden
+    },
+
+    bat2: {
+      status:
+        nachtelijkeAntiImportBijVeelZonMorgen ? "nachtmodus_geen_import" :
+        absorbeerOverschotPv ? "laden_om_pv_overschot_op_te_nemen" :
+        exportVermijdenDoorNegatieveVerkoop ? "wachten_op_werkelijk_overschot" :
+        koopNegatiefNu ? "laden_negatieve_prijs" :
+        bat2LadenGeblokkeerd ? "laden_geblokkeerd_voor_zon" :
+        bup > 0 ? "laden_toegelaten" :
+        gdes < 0 ? "ontladen" :
+        "regeling_normaal",
+      gdes_w: gdes,
+      blo_w: blo,
+      bup_w: bup,
+      soc_pct: Math.round(soc2),
+      energie_kwh: vastGetalVeilig(bat2OpgeslagenKwh, 2, null),
+      reden: bat2Reden
+    },
+
+    kleine_pv: {
+      huidig_vermogen_w: Math.round(pv2Nu),
+      toegestaan_vermogen_w: Math.round(pv2Cmd),
+      curtailment_actief: pvCurtailActief,
+      reden: pvCurtailReden
+    },
+
+    context: {
+      p1_w: Math.round(p1),
+      resterende_zon_vandaag_kwh: vastGetalVeilig(overKwh, 2, 0),
+      zon_morgen_kwh: vastGetalVeilig(pvMorgen, 2, 0),
+      reserve_voor_zon_kwh: vastGetalVeilig(reserveVoorZonKwh, 2, 0),
+      overtollige_energie_kwh: vastGetalVeilig(overtolligeEnergieKwh, 2, 0),
+      koop_prijs_nu: Number.isFinite(prijsKoopNu) ? prijsKoopNu : null,
+      verkoop_prijs_nu: Number.isFinite(prijsVerkoopNu) ? prijsVerkoopNu : null,
+      toekomstige_negatieve_uren: toekomstigeNegUren,
+      nacht_doel_soc_pct: nachtDoelSoc,
+      laden_geblokkeerd_door_verwachte_zon: ladenBlokkerenDoorVerwachteZon,
+      export_vermijden_door_negatieve_verkoop: exportVermijdenDoorNegatieveVerkoop,
+      absorbeer_overschot_pv: absorbeerOverschotPv,
+      nachtelijke_anti_import_bij_veel_zon_morgen: nachtelijkeAntiImportBijVeelZonMorgen
+    }
+  },
+  ...debug
+};
+
+const uit7 = gewijzigd("ha_pv2_cmd", pv2Cmd, 10)
+  ? { topic: "pv2_limit_w", payload: pv2Cmd, ...debug }
+  : null;
+
+return [uit1, uit2, uit3, uit4, uit5, uit6, uit7];
