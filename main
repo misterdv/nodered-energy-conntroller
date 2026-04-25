@@ -96,6 +96,119 @@ function leesCfgGetal(cfg, sleutel, fallback) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function pasBat2ResponseGuardToe(args) {
+  const {
+    guardAan,
+    soc2Ontbreekt,
+    p1,
+    gdes,
+    bup,
+    gewensteGdes,
+    absorbeerOverschotPv,
+    nachtelijkeAntiImportBijVeelZonMorgen,
+    voorafLeegmaken,
+    agressiefVoorafLeegmaken,
+    bat2LadenGeblokkeerd,
+    redenBlokkeringBat2Laden,
+    nuMs,
+    foutDrempelW,
+    mismatchStreakDrempel,
+    cooldownMs,
+    releaseStapW
+  } = args;
+
+  let nieuwGdes = gdes;
+  let nieuweBup = bup;
+  let nieuweGewensteGdes = gewensteGdes;
+  let nieuwBat2LadenGeblokkeerd = bat2LadenGeblokkeerd;
+  let nieuweRedenBlokkeringBat2Laden = redenBlokkeringBat2Laden;
+
+  let bat2ResponsRegelaarActief = false;
+  let bat2ResponsGuardActief = false;
+  let bat2VolgtSetpoint = true;
+  let bat2RegelFoutW = null;
+  let bat2MismatchStreak = 0;
+
+  if (!(guardAan && soc2Ontbreekt)) {
+    return {
+      gdes: nieuwGdes,
+      bup: nieuweBup,
+      gewensteGdes: nieuweGewensteGdes,
+      bat2LadenGeblokkeerd: nieuwBat2LadenGeblokkeerd,
+      redenBlokkeringBat2Laden: nieuweRedenBlokkeringBat2Laden,
+      bat2ResponsRegelaarActief,
+      bat2ResponsGuardActief,
+      bat2VolgtSetpoint,
+      bat2RegelFoutW,
+      bat2MismatchStreak
+    };
+  }
+
+  const regelingActief =
+    (nieuweBup > 0) ||
+    Math.abs(nieuwGdes) >= 400 ||
+    absorbeerOverschotPv ||
+    nachtelijkeAntiImportBijVeelZonMorgen ||
+    voorafLeegmaken ||
+    agressiefVoorafLeegmaken;
+
+  bat2ResponsRegelaarActief = regelingActief;
+
+  const regelFout = p1 - nieuwGdes;
+  bat2RegelFoutW = regelFout;
+  bat2VolgtSetpoint = Math.abs(regelFout) < foutDrempelW;
+
+  let mismatchTeller = Number(context.get("bat2RespMismatchStreak"));
+  if (!Number.isFinite(mismatchTeller)) mismatchTeller = 0;
+
+  if (regelingActief && !bat2VolgtSetpoint) mismatchTeller += 1;
+  else mismatchTeller = Math.max(0, mismatchTeller - 1);
+
+  let cooldownTotMs = Number(context.get("bat2RespCooldownTotMs"));
+  if (!Number.isFinite(cooldownTotMs)) cooldownTotMs = 0;
+
+  const cooldownActief = nuMs < cooldownTotMs;
+  const drempelBereikt =
+    mismatchStreakDrempel >= 1 &&
+    mismatchTeller >= mismatchStreakDrempel;
+
+  if (!cooldownActief && drempelBereikt) {
+    cooldownTotMs = nuMs + cooldownMs;
+    mismatchTeller = 0;
+    context.set("bat2RespCooldownTotMs", cooldownTotMs);
+  }
+
+  const nuCooldownActief = nuMs < cooldownTotMs;
+  bat2ResponsGuardActief = nuCooldownActief;
+
+  if (nuCooldownActief) {
+    const richtingNul = begrens(0 - nieuwGdes, -releaseStapW, releaseStapW);
+    nieuwGdes = Math.round(nieuwGdes + richtingNul);
+    nieuweGewensteGdes = 0;
+    nieuweBup = -1;
+    nieuwBat2LadenGeblokkeerd = true;
+    nieuweRedenBlokkeringBat2Laden =
+      "Bat2 reageert niet voldoende op setpoint zonder SOC2; tijdelijk ontlasten en opnieuw synchroniseren";
+    context.set("gdesPrev", nieuwGdes);
+  }
+
+  context.set("bat2RespMismatchStreak", mismatchTeller);
+  bat2MismatchStreak = mismatchTeller;
+
+  return {
+    gdes: nieuwGdes,
+    bup: nieuweBup,
+    gewensteGdes: nieuweGewensteGdes,
+    bat2LadenGeblokkeerd: nieuwBat2LadenGeblokkeerd,
+    redenBlokkeringBat2Laden: nieuweRedenBlokkeringBat2Laden,
+    bat2ResponsRegelaarActief,
+    bat2ResponsGuardActief,
+    bat2VolgtSetpoint,
+    bat2RegelFoutW,
+    bat2MismatchStreak
+  };
+}
+
 function veiligeFoutTerugkeer(fouttekst, extraDebug = {}) {
   statusFout(fouttekst);
 
