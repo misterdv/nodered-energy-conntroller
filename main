@@ -785,36 +785,58 @@ if (nachtelijkeAntiImportBijVeelZonMorgen && !koopNegatiefNu) {
 blo = begrens(Math.round(blo), -5000, 0);
 bup = begrens(Math.round(bup), -1, BAT2_MAX_CHARGE);
 
-const bat2GuardResultaat = pasBat2ResponseGuardToe({
-  guardAan: BAT2_RESPONS_GUARD_AAN,
-  soc2Ontbreekt,
-  p1,
-  gdes,
-  bup,
-  gewensteGdes,
-  absorbeerOverschotPv,
-  nachtelijkeAntiImportBijVeelZonMorgen,
-  voorafLeegmaken,
-  agressiefVoorafLeegmaken,
-  bat2LadenGeblokkeerd,
-  redenBlokkeringBat2Laden,
-  nuMs,
-  foutDrempelW: BAT2_RESPONS_FOUT_DREMPEL_W,
-  mismatchStreakDrempel: BAT2_RESPONS_STREAK,
-  cooldownMs: BAT2_RESPONS_COOLDOWN_MS,
-  releaseStapW: BAT2_RESPONS_RELEASE_STAP_W
-});
+if (BAT2_RESPONS_GUARD_AAN && soc2Ontbreekt) {
+  const regelingActief =
+    (bup > 0) ||
+    Math.abs(gdes) >= 400 ||
+    absorbeerOverschotPv ||
+    nachtelijkeAntiImportBijVeelZonMorgen ||
+    voorafLeegmaken ||
+    agressiefVoorafLeegmaken;
 
-gdes = bat2GuardResultaat.gdes;
-bup = bat2GuardResultaat.bup;
-gewensteGdes = bat2GuardResultaat.gewensteGdes;
-bat2LadenGeblokkeerd = bat2GuardResultaat.bat2LadenGeblokkeerd;
-redenBlokkeringBat2Laden = bat2GuardResultaat.redenBlokkeringBat2Laden;
-bat2ResponsRegelaarActief = bat2GuardResultaat.bat2ResponsRegelaarActief;
-bat2ResponsGuardActief = bat2GuardResultaat.bat2ResponsGuardActief;
-bat2VolgtSetpoint = bat2GuardResultaat.bat2VolgtSetpoint;
-bat2RegelFoutW = bat2GuardResultaat.bat2RegelFoutW;
-bat2MismatchStreak = bat2GuardResultaat.bat2MismatchStreak;
+  bat2ResponsRegelaarActief = regelingActief;
+
+  const regelFout = p1 - gdes;
+  bat2RegelFoutW = regelFout;
+  bat2VolgtSetpoint = Math.abs(regelFout) < BAT2_RESPONS_FOUT_DREMPEL_W;
+
+  let mismatchTeller = Number(context.get("bat2RespMismatchStreak"));
+  if (!Number.isFinite(mismatchTeller)) mismatchTeller = 0;
+
+  if (regelingActief && !bat2VolgtSetpoint) mismatchTeller += 1;
+  else mismatchTeller = Math.max(0, mismatchTeller - 1);
+
+  let cooldownTotMs = Number(context.get("bat2RespCooldownTotMs"));
+  if (!Number.isFinite(cooldownTotMs)) cooldownTotMs = 0;
+
+  const cooldownActief = nuMs < cooldownTotMs;
+  const drempelBereikt =
+    BAT2_RESPONS_STREAK >= 1 &&
+    mismatchTeller >= BAT2_RESPONS_STREAK;
+
+  if (!cooldownActief && drempelBereikt) {
+    cooldownTotMs = nuMs + BAT2_RESPONS_COOLDOWN_MS;
+    mismatchTeller = 0;
+    context.set("bat2RespCooldownTotMs", cooldownTotMs);
+  }
+
+  const nuCooldownActief = nuMs < cooldownTotMs;
+  bat2ResponsGuardActief = nuCooldownActief;
+
+  if (nuCooldownActief) {
+    const richtingNul = begrens(0 - gdes, -BAT2_RESPONS_RELEASE_STAP_W, BAT2_RESPONS_RELEASE_STAP_W);
+    gdes = Math.round(gdes + richtingNul);
+    gewensteGdes = 0;
+    bup = -1;
+    bat2LadenGeblokkeerd = true;
+    redenBlokkeringBat2Laden =
+      "Bat2 reageert niet voldoende op setpoint zonder SOC2; tijdelijk ontlasten en opnieuw synchroniseren";
+    context.set("gdesPrev", gdes);
+  }
+
+  context.set("bat2RespMismatchStreak", mismatchTeller);
+  bat2MismatchStreak = mismatchTeller;
+}
 
 /********************************************************************
  * BATTERIJ 1
