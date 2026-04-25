@@ -1,0 +1,233 @@
+[
+  {
+    "id": "f9f3fd52b7eaa001",
+    "type": "tab",
+    "label": "HA Sensor History Fetch",
+    "disabled": false,
+    "info": "Haalt historische data op van de energie-sensoren via de Home Assistant History API."
+  },
+  {
+    "id": "e8a58fcd76dfe101",
+    "type": "inject",
+    "z": "f9f3fd52b7eaa001",
+    "name": "Elke 30 min + handmatig",
+    "props": [
+      {
+        "p": "payload"
+      }
+    ],
+    "repeat": "1800",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "",
+    "payloadType": "date",
+    "x": 170,
+    "y": 120,
+    "wires": [
+      [
+        "2a11c318b2874102"
+      ]
+    ]
+  },
+  {
+    "id": "2a11c318b2874102",
+    "type": "function",
+    "z": "f9f3fd52b7eaa001",
+    "name": "Bouw history-requests",
+    "func": "const BASE_URL = env.get('HA_BASE_URL');\nconst TOKEN = env.get('HA_TOKEN');\n\nif (!BASE_URL || !TOKEN) {\n    node.error('Zet HA_BASE_URL en HA_TOKEN als environment variables in Node-RED.');\n    return null;\n}\n\nconst sensors = [\n  'sensor.p1_meter_5c2faf04849e_active_power',\n  'sensor.epex_spot_data_price',\n  'sensor.lilygo_rs485_3_marstek_battery_state_of_charge',\n  'sensor.soc',\n  'sensor.energy_production_today_remaining',\n  'sensor.energy_production_tomorrow',\n  'sensor.power_production_next_12hours',\n  'sensor.power_production_next_24hours',\n  'sensor.kotsolar_total_power',\n  'sensor.p1_meter_5c2faf04849e_active_average_demand'\n];\n\nconst now = new Date();\nconst start = new Date(now.getTime() - 24 * 3600 * 1000);\n\nmsg.requests = sensors.map((entityId) => {\n  const startIso = start.toISOString();\n  const endIso = now.toISOString();\n  const url = `${BASE_URL.replace(/\\/$/, '')}/api/history/period/${startIso}?filter_entity_id=${encodeURIComponent(entityId)}&end_time=${encodeURIComponent(endIso)}`;\n\n  return {\n    entity_id: entityId,\n    method: 'GET',\n    url,\n    headers: {\n      Authorization: `Bearer ${TOKEN}`,\n      'Content-Type': 'application/json'\n    }\n  };\n});\n\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 390,
+    "y": 120,
+    "wires": [
+      [
+        "4dc6b54f8193fd03"
+      ]
+    ]
+  },
+  {
+    "id": "4dc6b54f8193fd03",
+    "type": "split",
+    "z": "f9f3fd52b7eaa001",
+    "name": "Per sensor",
+    "splt": "\\n",
+    "spltType": "str",
+    "arraySplt": 1,
+    "arraySpltType": "len",
+    "stream": false,
+    "addname": "",
+    "property": "requests",
+    "x": 590,
+    "y": 120,
+    "wires": [
+      [
+        "e4e9669f19418d04"
+      ]
+    ]
+  },
+  {
+    "id": "e4e9669f19418d04",
+    "type": "change",
+    "z": "f9f3fd52b7eaa001",
+    "name": "Map request -> msg",
+    "rules": [
+      {
+        "t": "set",
+        "p": "entity_id",
+        "pt": "msg",
+        "to": "requests.entity_id",
+        "tot": "msg"
+      },
+      {
+        "t": "set",
+        "p": "method",
+        "pt": "msg",
+        "to": "requests.method",
+        "tot": "msg"
+      },
+      {
+        "t": "set",
+        "p": "url",
+        "pt": "msg",
+        "to": "requests.url",
+        "tot": "msg"
+      },
+      {
+        "t": "set",
+        "p": "headers",
+        "pt": "msg",
+        "to": "requests.headers",
+        "tot": "msg"
+      },
+      {
+        "t": "delete",
+        "p": "requests",
+        "pt": "msg"
+      }
+    ],
+    "action": "",
+    "property": "",
+    "from": "",
+    "to": "",
+    "reg": false,
+    "x": 800,
+    "y": 120,
+    "wires": [
+      [
+        "dba9e22971a1eb05"
+      ]
+    ]
+  },
+  {
+    "id": "dba9e22971a1eb05",
+    "type": "http request",
+    "z": "f9f3fd52b7eaa001",
+    "name": "HA /api/history/period",
+    "method": "use",
+    "ret": "obj",
+    "paytoqs": "ignore",
+    "url": "",
+    "tls": "",
+    "persist": false,
+    "proxy": "",
+    "insecureHTTPParser": false,
+    "authType": "",
+    "senderr": false,
+    "headers": [],
+    "x": 1030,
+    "y": 120,
+    "wires": [
+      [
+        "88a519fbe2d2aa06"
+      ]
+    ]
+  },
+  {
+    "id": "88a519fbe2d2aa06",
+    "type": "function",
+    "z": "f9f3fd52b7eaa001",
+    "name": "Normaliseer history",
+    "func": "const entityId = msg.entity_id;\nconst series = Array.isArray(msg.payload) && msg.payload.length ? msg.payload[0] : [];\n\nmsg.topic = entityId;\nmsg.payload = {\n  entity_id: entityId,\n  points: series.map((row) => ({\n    last_changed: row.last_changed,\n    state: row.state\n  }))\n};\n\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 1240,
+    "y": 120,
+    "wires": [
+      [
+        "66f60b08b0cc6d07"
+      ]
+    ]
+  },
+  {
+    "id": "66f60b08b0cc6d07",
+    "type": "join",
+    "z": "f9f3fd52b7eaa001",
+    "name": "Combineer 10 sensors",
+    "mode": "custom",
+    "build": "object",
+    "property": "payload",
+    "propertyType": "msg",
+    "key": "topic",
+    "joiner": "\\n",
+    "joinerType": "str",
+    "useparts": true,
+    "accumulate": false,
+    "timeout": "",
+    "count": "10",
+    "reduceRight": false,
+    "reduceExp": "",
+    "reduceInit": "",
+    "reduceInitType": "",
+    "reduceFixup": "",
+    "x": 1460,
+    "y": 120,
+    "wires": [
+      [
+        "f4959c4578f73f08",
+        "d27168235dd56b09"
+      ]
+    ]
+  },
+  {
+    "id": "f4959c4578f73f08",
+    "type": "debug",
+    "z": "f9f3fd52b7eaa001",
+    "name": "History debug",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "statusVal": "",
+    "statusType": "auto",
+    "x": 1670,
+    "y": 80,
+    "wires": []
+  },
+  {
+    "id": "d27168235dd56b09",
+    "type": "file",
+    "z": "f9f3fd52b7eaa001",
+    "name": "Bewaar JSON snapshot",
+    "filename": "/data/history_snapshot.json",
+    "filenameType": "str",
+    "appendNewline": true,
+    "createDir": true,
+    "overwriteFile": "true",
+    "encoding": "none",
+    "x": 1680,
+    "y": 160,
+    "wires": [
+      []
+    ]
+  }
+]
